@@ -1,0 +1,270 @@
+# CF-Navs 问题排查
+
+## 部署失败
+
+### Authentication error
+
+重新登录 Cloudflare：
+
+```bash
+npx wrangler login
+```
+
+### KV namespace `replace-with-your-kv-namespace-id` is not valid
+
+这是旧版公开 `wrangler.toml` 中的 KV 占位符被 Cloudflare 当成真实 ID 使用导致的。请将 Fork 更新到最新版本，确认 `wrangler.toml` 中的 `[[kv_namespaces]]` 只有 `binding = "SESSION"`、没有 `id = "replace-with-your-kv-namespace-id"`，然后重新运行在线部署。
+
+在线部署命令应使用：
+
+```bash
+npm run build && npx wrangler deploy
+```
+
+首次部署后访问 `/install`，输入 `SETUP_TOKEN` 并创建管理员账号。Cloudflare Git 引导流程负责创建并绑定 `DB`/`SESSION`；本地 CLI 部署则运行 `npm run setup:wrangler` 生成被 Git 忽略的 `wrangler.local.toml`，执行 `npx wrangler secret put SETUP_TOKEN` 后运行 `npm run deploy`，同样通过 `/install` 初始化。
+
+### 日志路径包含 `/workers/scripts/.../versions`
+
+这通常表示 Cloudflare 正在执行预览分支的 `wrangler versions upload`。首次创建 D1/KV 资源时，请确认 Cloudflare Workers Builds 的生产分支是 `main`，Build command 为 `npm run build`，Deploy command 为 `npx wrangler deploy`，然后从 `main` 重新触发部署。资源创建完成后再按需开启预览分支部署。
+
+### `/install` 配置提示与对应小节
+
+`GET /api/install/status` 始终返回成功包络（`code=0`、`msg="ok"`），真正的状态在 `data` 里；`/install` 页面据此显示提示。按页面上看到的标题或状态字面量查下表，再看对应小节：
+
+| 页面标题 | `data.state` / `data.reason` | 触发条件 | 排障小节 |
+| --- | --- | --- | --- |
+| 还缺少部署密钥 | `configuration_required` / `setup_token_missing` | 绑定齐全、D1 与 KV 均可达、站点未安装，但 Worker 读不到非空 `SETUP_TOKEN` | 「`/install` 提示安装令牌无效」 |
+| 还缺少存储绑定 | `bindings_missing`，`missing` 列出 `DB` / `SESSION` | Worker 缺少 `DB` D1 绑定或 `SESSION` KV 绑定 | 「Missing binding」 |
+| 数据库暂时不可用 | `unavailable` / `database_unreachable` | `DB` 绑定存在但 D1 探测查询失败，或读取安装状态时抛错 | 「`/install` 提示数据库初始化失败」 |
+| 会话存储暂时不可用 | `unavailable` / `session_store_unreachable` | `SESSION` 绑定存在但 KV 读取失败 | 「`/install` 提示会话存储暂时不可用」 |
+| 无法检查安装状态 | 无对应后端状态；前端 `status_error`，状态探测本身失败 | `/api/install/status` 请求没有返回任何状态 | 先确认部署成功，再按上面四条逐项排查绑定与可达性 |
+
+### `/install` 提示安装令牌无效（页面显示「还缺少部署密钥」）
+
+1. 确认当前访问的域名属于正在部署的同一个 Worker，不是另一个 Worker、Pages 项目或旧的自定义域名路由。
+2. 确认 Worker 的 **设置 → 变量和密钥** 中选择的是**生产环境**，存在类型为**密钥**的变量 `SETUP_TOKEN`，名称大小写完全一致；预览环境的 Secret 不会自动提供给生产流量。
+3. GitHub 导入器不应自动生成 `SETUP_TOKEN` 参数；该名称不在 `package.json` 的 Cloudflare 资源元数据中。首轮部署不要求这个 Secret，部署完成后必须手动创建生产环境 Secret，并重新触发 `main` 生产分支部署；如果仍返回 `setup_token_missing`，优先检查部署目标和访问域名是否一致。
+4. 确认输入值没有前后空格；不要把管理员密码填到 `SETUP_TOKEN`。安装令牌仅用于授权一次安装，管理员密码在 `/install` 页面另行设置。
+5. 可直接请求 `GET /api/install/status` 检查运行时状态：返回 `needs_install` 表示 Worker 已读到 Secret；返回 `configuration_required` / `setup_token_missing` 表示当前处理请求的 Worker 环境没有读到 Secret。
+6. 如果站点已经安装完成，则不再需要 `SETUP_TOKEN`。安装状态检查不要求令牌，删除 Secret 不影响运行；后续安装请求仍会被永久拒绝。
+
+### `/install` 提示数据库初始化失败或「数据库暂时不可用」
+
+先确认 Worker 的 `DB` D1 和 `SESSION` KV 绑定存在。正常安装由 `/install` 自动初始化 schema；如果安装器仍失败，可在 D1 SQL Console 手动执行 [schema.sql](../../schema.sql) 后返回 `/install` 重试。手动 SQL 是恢复手段，不是正常部署步骤。
+
+页面标题为「数据库暂时不可用」时是另一种情况：`GET /api/install/status` 返回 `unavailable` / `database_unreachable`，即 `DB` 绑定存在但 D1 探测查询失败，或读取安装状态时抛错。这不是 schema 缺失，手动执行 `schema.sql` 修不好它 —— 先确认 `DB` 指向的 D1 数据库仍然存在、选择的是生产环境绑定，再用页面上的「重试数据库检查」重新探测。
+
+### `/install` 提示会话存储暂时不可用
+
+页面标题为「会话存储暂时不可用」，`GET /api/install/status` 返回 `unavailable` / `session_store_unreachable`：`SESSION` KV 绑定存在，但当前读不到 KV。
+
+1. 在 Worker 的 **设置 → 绑定** 中确认 `SESSION` 指向的 KV 命名空间仍然存在，没有被删除或改名。
+2. 确认使用的是**生产环境**绑定；预览环境的 KV 命名空间不会提供给生产流量。
+3. 排除 Cloudflare KV 侧的临时故障后，用页面上的「重试会话存储检查」重新探测。
+4. 安装完成后 `SESSION` 仍被登录限流与会话撤销名单使用。绑定不可用时**登录会直接失败**（`code=1500` + `required SESSION binding is unavailable`），已登录请求返回 401，而不是静默降级；公开首页读取与点击计数不受影响（见 [API 契约](../reference/API_CONTRACT.md) 的鉴权规则）。
+
+### Missing binding（页面显示「还缺少存储绑定」）
+
+`GET /api/install/status` 返回 `bindings_missing`，`missing` 列出缺失的 `DB`（D1）或 `SESSION`（KV）。通常是绑定没有写入本地部署配置。
+
+1. 确认已经创建 D1 和 KV。
+2. 运行 `npm run setup:wrangler`。
+3. 确认本地存在 `wrangler.local.toml`。
+
+### Database not found
+
+`npm run db:init:remote` 只用于 `/install` 无法应用 schema 时的恢复。执行前检查 `wrangler.local.toml` 中的 `database_id` 是否对应当前 Cloudflare 账号下的 `cf-navs-db`：
+
+```bash
+npm run db:init:remote
+```
+
+如果仍失败，检查 `wrangler.local.toml` 中的 `database_id` 是否对应当前 Cloudflare 账号下的 `cf-navs-db`。
+
+## 登录失败
+
+### 第一层：仍能登录
+
+进入 **站点设置 → 账号安全**，输入当前密码后更新管理员密码。修改成功后，现有登录会话会失效，需要使用新密码重新登录。
+
+### 第二层：无法登录，但能操作 Cloudflare Secret
+
+访问站点 `/recover`，输入生产环境的 `SETUP_TOKEN` 和新密码。恢复只修改密码，不修改管理员用户名；新密码须为 8–12 位，且至少包含两类字符。
+
+如果忘记了原 `SETUP_TOKEN`：
+
+1. 在 Worker **设置 → 变量和密钥 → 生产环境** 新增或编辑类型为**密钥**的 `SETUP_TOKEN`。
+2. 保存后重新触发生产分支部署；CLI 部署则使用 `npx wrangler secret put SETUP_TOKEN` 后运行 `npm run deploy`。
+3. 使用新值重新访问 `/recover`。
+
+`SETUP_TOKEN` 不存入 D1；Worker 每次请求读取当前环境值。恢复成功后会轮换 JWT secret，旧会话立即失效。错误或未配置令牌统一返回 401，不会泄露当前环境是否配置了令牌；限流和密码校验错误遵循 API 的 `HTTP 200 + code` 包络。
+
+### 第三层：使用 INIT_ADMIN_* 重部署兜底
+
+无法使用 `/recover` 时，以下流程仅用于已完成初始化的旧数据库升级或凭据恢复，不适用于全新部署。修改 `INIT_ADMIN_USER` 和 `INIT_ADMIN_PASSWORD` 后重新部署，下一次使用新凭据登录会自动覆盖 D1 中的管理员凭据；本地 CLI 场景优先使用项目脚本生成的 `wrangler.local.toml`：
+
+```bash
+npm run wrangler -- secret put INIT_ADMIN_PASSWORD
+npm run deploy
+```
+
+如果不使用项目脚本，必须显式传入包含真实 D1/KV ID 的本地配置（例如 `--config wrangler.local.toml`），不得用不带资源 ID 的公共 `wrangler.toml` 误部署。
+
+升级前已创建但没有初始化标记的旧数据库，再设置新的 `RESET_ADMIN_CREDENTIALS` 值（例如 `reset-2026-07-12`）并重新部署，用新凭据登录一次即可。成功后可移除该变量；同一标记不会重复重置，下一次强制重置必须使用新值。
+
+如果既没有 Cloudflare 后台权限，也无法重新部署，则不存在应用层恢复路径，这是部署者权限的固有边界。
+
+### KV 相关错误
+
+`SESSION` KV 不保存登录会话本身。登录使用无状态 JWT；该命名空间用于登录/点击限流和 JWT 撤销名单。
+
+**绑定缺失或不可用时的可见症状**（2026-09-05 起统一为下列口径，见 [API 契约](../reference/API_CONTRACT.md) 的鉴权规则）：
+
+- `POST /api/login` 返回 `code=1500`、`msg` 为 `required SESSION binding is unavailable`。**看到这条文案就说明是绑定问题**，不需要再猜；此前它表现为笼统的 `internal server error`。
+- 已登录的请求返回 `401` / `code=1001`：撤销名单读不到时会拒绝会话，而不是放行。这是刻意的——放行等于「撤销名单不存在」而调用方无从得知。
+- 公开首页与点击计数**不受影响**：匿名读取正常，点击仍然计数，只是失去限流保护。
+
+请检查：
+
+1. `npx wrangler kv namespace create SESSION` 是否已执行。
+2. `npm run setup:wrangler` 是否已生成最新绑定。
+3. Worker 日志中是否出现 KV binding 错误。
+
+查看日志：
+
+```bash
+npx wrangler tail
+```
+
+## 数据无法保存
+
+数据保存依赖 D1 数据库。请检查：
+
+1. D1 数据库是否已创建。
+2. `wrangler.local.toml` 中的 D1 `database_id` 是否正确。
+3. Worker 日志是否有 SQL 或 binding 错误。
+4. 全新安装是否已通过 `/install` 完成；仅在安装器 schema 初始化失败时执行 `npm run db:init:remote` 恢复。
+
+## 页面无法加载
+
+### 静态资源 404
+
+重新构建并部署：
+
+```bash
+npm run build
+npm run deploy
+```
+
+确认 `dist/` 目录存在，并检查 Workers 部署日志是否成功上传 assets。
+
+### 新版本没有生效
+
+浏览器可能仍在使用旧 Service Worker 或旧静态资源缓存。
+
+1. 强制刷新页面。
+2. 如仍异常，打开浏览器 DevTools，注销旧 Service Worker 后重新加载。
+3. 确认 `sw.js` 返回的是最新版本。
+
+## 图标显示异常
+
+### 普通网站图标为空
+
+部分网站 favicon 不允许 Worker 跨站抓取或返回异常内容。保存普通 HTTP(S) 图标时，刷新接口会短超时尝试生成 `icon_blob`；如果失败，首页会继续尝试使用已保存的图标 URL。可以编辑书签后选择：
+
+- Favicon.im 候选
+- Google favicon 候选
+- 文字图标
+- Iconify 图标
+- 自定义图片 URL
+- 表情或短文字
+
+如果预览正常但保存后仍显示标题首字，请先检查书签保存的 `icon` 是否仍是可访问的 HTTP(S) 图片地址，并确认新版应用已加载。标准模式在缺少 D1 图标正文时按需请求 `/api/icon/:id`；该响应保持 `no-store`，只用于当前渲染。可信设备在开关已启用、会话回执有效且版本许可时，先读 IndexedDB；未命中才请求会话鉴权的 `/api/icon-local-copy`，成功并解码后才保存本地正文。标准模式或协议不兼容时仍走普通展示回退，不能把普通代理响应手动写入缓存。
+
+### 图标没有走本地缓存 / 显示旧图标
+
+- 本地图标保存在 IndexedDB `cf-navs-icons-v2`（DevTools → Application → IndexedDB），每个书签 / 分类一条，`version` 是图标代理 URL（不含 `key`）。版本不同会自动重下，不需要手动清理。
+- 单张超过 512 KiB 的图片只显示不保存；浏览器配额满时退回内存，刷新后会重新请求。
+- 兜底文字图（响应头 `X-Icon-Fallback: 1`）和失败请求不会保存；恢复由卡片原有的有限重试负责。
+- 若怀疑本地条目损坏，删除该 IndexedDB 库后刷新即可，下次显示会重新下载。
+
+### Iconify 图标不显示
+
+检查保存值是否为可识别格式，例如：
+
+```text
+mdi:home
+simple-icons:github
+https://icon-sets.iconify.design/mdi/home/
+```
+
+新增/编辑弹窗、后台预览和首页已保存的 Iconify 图标都应走同源 `/api/iconify/*` 代理，公开正文可由 Worker edge cache 复用。Service Worker 只缓存可读且不超过 512KB 的跨域 Iconify 资源，不持久化 `opaque` 响应。
+
+### 部署新版后图标行为仍旧
+
+强制刷新页面，让新版 Service Worker 激活。必要时清理站点缓存后重试。
+
+### 浏览器缓存空间异常变大
+
+如果 DevTools 的 Application -> Storage 显示本站缓存空间明显大于 D1 数据量，先确认当前 Service Worker 已是最新版本，再清理站点数据后复测：首页完整滚动、刷新页面、进入后台书签列表翻页，缓存空间都不应持续线性增长。
+
+常见原因：
+
+- 旧 Service Worker 仍在缓存跨域 `opaque` Iconify 响应，Chrome 会对这类响应按较大配额计入 Cache Storage。
+- 旧实现曾把完整后台聚合数据中的 `icon_blob` 又复制到浏览器本地图标缓存；当前聚合响应只提供 `icon_cached`，该条仅用于识别旧版本遗留数据。
+- 多次登录留下旧 `AdminData` 快照。
+
+对象图标正文保存在独立的 IndexedDB（`cf-navs-icons-v2`），不计入 Cache Storage；普通对象代理和 API 响应仍不进入 Cache Storage。
+
+## 首页公开访问异常
+
+如果未登录访问首页提示需要登录：
+
+1. 登录后台。
+2. 进入站点设置。
+3. 确认已开启公开模式。
+4. 退出登录后刷新首页验证。
+
+如果公开模式已经开启但匿名访问仍异常，检查 Worker 日志中 `/api/public/data` 是否报错。
+
+## Sun-Panel 导入失败
+
+请检查：
+
+1. JSON 文件是否为 Sun-Panel 原始导出或 CF-Navs 备份格式。
+2. 文件是否过大导致浏览器或 Worker 超时。
+3. 浏览器控制台是否有解析错误。
+4. Worker 日志是否有 D1 写入错误。
+
+导入模式可选择“追加合并”或“覆盖现有数据”；执行覆盖前，建议先在后台导出一份 CF-Navs 备份。
+
+## 常用诊断命令
+
+```bash
+npx wrangler tail
+npm run type-check
+npm run build
+```
+
+不要直接查询并打印 `settings.value`。其中可能包含 `custom_js`、`footer_html`、`image_host_url` 等站点内容；如需确认配置是否存在，只查询非敏感元数据或键名，并先确认当前 Cloudflare 账号、Worker、D1 和 Wrangler 配置指向正确项目。
+
+## 线上 Chrome 验证异常
+
+如果 Codex/自动化环境中没有暴露 Chrome 插件要求的 Node REPL 工具，启动带唯一 `--user-data-dir` 的独立 Chrome 调试端口后直接使用 CDP 验证线上站点。不要连接宿主机日常使用的 Chrome 或默认 profile。
+
+关键注意点：
+
+- 复用已有 DevTools 端点只适用于当前任务明确授权的专用测试浏览器；结束时只关闭测试 target，不能调用 `Browser.close`。
+- `Chrome /json/new` 在新版本中使用 `PUT`，不要用 `GET`。
+- `curl` 在 PowerShell 中拼 JSON 登录体容易引号转义失败，建议用 Node `fetch` 或页面上下文 `fetch`。
+- 右键菜单验证使用 CDP `Input.dispatchMouseEvent` 的 right button 事件，比直接 `dispatchEvent` 更接近真实操作。
+- 验证完成后只清理本次启动并记录了精确 profile 的 Chrome 进程。不要使用按进程名关闭全部 Chrome 的命令。
+- 移动端背景边界验证使用约 `390x844` 的视口，分别检查初始位置、页面中段和 `scrollY = scrollHeight - innerHeight` 的底部位置；渐变和背景图片都必须覆盖视口，不能在顶部或底部出现白色根画布。检查 `html` 根节点的首页背景变量是否与当前主题一致，并同时记录控制台错误、页面异常和失败请求。
+
+常规验收项：
+
+- 首页标题、搜索框、书签卡片正常。
+- 输入搜索词后摘要和卡片数量变化符合预期。
+- 登录后管理入口、退出按钮、主题按钮可见。
+- 后台分类/书签列表、编辑弹窗可打开。
+- `/api/config`、`/api/settings`、`/api/admin/data`、`/api/data/version` 返回 `code: 0`。
+- 控制台错误、页面异常、失败请求和非预期 HTTP 4xx/5xx 都为 0。

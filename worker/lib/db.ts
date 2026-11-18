@@ -1,0 +1,71 @@
+// D1 查询封装的统一入口：按数据职责拆分到 ./db/*，此处集中重导出，
+// 保持路由层 `../lib/db` 导入路径不变。
+
+export { settingsFromPatchDefaults } from './settingsData'
+
+export { ensureSchema } from './db/schema'
+
+export {
+  listCategories,
+  getCategory,
+  isCategoryIconAnonymouslyVisible,
+  createCategory,
+  updateCategory,
+  deleteCategory,
+  batchDeleteCategories,
+  sortCategories,
+  CategoryConflictError,
+  CategoryValidationError,
+} from './db/categories'
+
+export {
+  listBookmarks,
+  listBookmarksWithIconBlobs,
+  getBookmarkForEdit,
+  getBookmarkIconData,
+  isBookmarkIconAnonymouslyVisibleById,
+  createBookmark,
+  updateBookmark,
+  deleteBookmark,
+  batchDeleteBookmarks,
+  sortBookmarks,
+  reorganizeBookmarks,
+  batchMoveBookmarks,
+  BookmarkReorganizeError,
+  setIconBlob,
+  incrementBookmarkClick,
+  type BookmarkIconData,
+} from './db/bookmarks'
+
+export {
+  getPublicDataSource,
+  getAdminData,
+  getPublicCategoryIds,
+  isBookmarkIconAnonymouslyVisible,
+} from './db/aggregates'
+
+export {
+  getSettings,
+  getSiteConfig,
+  getSiteConfigWithDataVersion,
+  getSettingValues,
+  setSettingValue,
+  setSettingValues,
+  updateSettings,
+  writeSettingsPatch,
+} from './db/settings'
+
+export { importData } from './db/import'
+
+export {
+  Mutation,
+  commitMutation,
+  createMutationReceipt,
+  type MutationReceipt,
+} from './db/mutation'
+
+export {
+  BROWSER_SYNC_CATEGORY_TITLE,
+  ensureBrowserSyncCategoryStatement,
+  syncBrowserBookmarks,
+} from './db/browserSync'

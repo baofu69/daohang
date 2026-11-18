@@ -1,0 +1,368 @@
+import type { PublicBookmark, PublicCategory } from '../../shared/types'
+import {
+  buildCategoryForest,
+  filterCategoryForest,
+  flattenCategoryForest,
+  getCategoryPathMap,
+  normalizeCategories,
+  type CategoryNode,
+} from '../../shared/categoryHierarchy'
+
+export type HomeSection = {
+  id: string
+  categoryId: number
+  title: string
+  icon: string | null
+  icon_display?: 'image' | 'text' | 'empty'
+  icon_revision?: string | null
+  icon_write_epoch?: number
+  count: number
+  children: HomeSection[]
+}
+
+export type HomeCategorySelection = {
+  root: CategoryNode<PublicCategory> | null
+  child: CategoryNode<PublicCategory> | null
+}
+
+export type HomeCategoryGroup = {
+  root: CategoryNode<PublicCategory>
+  selected: CategoryNode<PublicCategory>
+}
+
+export function clampTitleFontSize(value: number | undefined): number {
+  if (!Number.isFinite(value)) return 32
+  return Math.min(72, Math.max(16, Number(value)))
+}
+
+export function normalizeSearchQuery(value: string): string {
+  return value.trim().toLowerCase()
+}
+
+export function buildSearchIndex(
+  items: PublicBookmark[],
+  categoryTitles: Map<number, string>,
+): Map<number, string> {
+  const nextIndex = new Map<number, string>()
+
+  for (const bookmark of items) {
+    nextIndex.set(
+      bookmark.id,
+      [
+        bookmark.title,
+        bookmark.url,
+        bookmark.description ?? '',
+        categoryTitles.get(bookmark.category_id) ?? '',
+      ].join('\n').toLowerCase(),
+    )
+  }
+
+  return nextIndex
+}
+
+export function bookmarkMatchesSearch(
+  bookmark: PublicBookmark,
+  keyword: string,
+  searchIndex: Map<number, string>,
+): boolean {
+  return (searchIndex.get(bookmark.id) ?? '').includes(keyword)
+}
+
+export function getVisibleCategoryIds(items: PublicBookmark[]): Set<number> {
+  const ids = new Set<number>()
+  for (const bookmark of items) {
+    ids.add(bookmark.category_id)
+  }
+  return ids
+}
+
+export function groupBookmarksByCategory(items: PublicBookmark[]): Map<number, PublicBookmark[]> {
+  const grouped = new Map<number, PublicBookmark[]>()
+
+  for (const bookmark of items) {
+    const list = grouped.get(bookmark.category_id) ?? []
+    list.push(bookmark)
+    grouped.set(bookmark.category_id, list)
+  }
+
+  return grouped
+}
+
+// 「经常访问」是首页最显眼的公共区块，私密书签不进入该区块：
+// 访客侧后端已过滤，管理员登录后拿到的是全量数据，必须在此处一并排除，
+// 否则管理员与访客看到的构成不同，后台实时预览也无法反映真实效果。
+export function getMostVisitedBookmarks(items: PublicBookmark[], limit: number): PublicBookmark[] {
+  const normalizedLimit = Math.max(0, Math.floor(Number(limit) || 0))
+  if (normalizedLimit === 0) return []
+
+  return items
+    .filter((bookmark) => (
+      (bookmark.click_count ?? 0) > 0
+      && bookmark.is_private !== true
+      && bookmark.is_private !== 1
+    ))
+    .sort((a, b) => (
+      (b.click_count ?? 0) - (a.click_count ?? 0)
+      || a.sort - b.sort
+      || a.id - b.id
+    ))
+    .slice(0, normalizedLimit)
+}
+
+// REQ-17：一级分类聚合「常用」区的固定显示上限，与全局「经常访问」数量(most_visited_count)解耦——
+// 分类聚合不随全局数量缩放，只设一个最多显示条数（Issue #31 第 2 点后续）。
+export const CATEGORY_HOT_LIMIT = 12
+
+// REQ-17：一级分类自身无直属书签时，聚合其整个子树的「常用」书签。
+// 频次优先（click_count 降序）取前 N；不足 N 时按 sort 回填，保证子树非空即非空。
+// 隐私口径：剔除私密书签（is_private），与公开「经常访问」一致。
+// 不再按匿名公开可见集(publicCategoryIds)过滤：入参 categoryBookmarks 已按当前视图过滤
+// —— 匿名由后端剔除私密分类及其整棵子树，管理员为全量。再套用匿名可见集会把管理员
+// 正在查看的私密一级分类旗下「公开子分类」的书签错误丢弃（Issue #31 复核：空私密一级聚合为空）。
+export function getCategoryHotBookmarks(
+  root: CategoryNode<PublicCategory>,
+  categoryBookmarks: ReadonlyMap<number, PublicBookmark[]>,
+  limit: number,
+): PublicBookmark[] {
+  const n = Math.max(0, Math.floor(Number(limit) || 0))
+  if (n === 0) return []
+
+  const subtreeIds = [root.id, ...root.children.map((child) => child.id)]
+  const pool: PublicBookmark[] = []
+  for (const id of subtreeIds) {
+    const bucket = categoryBookmarks.get(id)
+    if (!bucket) continue
+    for (const bookmark of bucket) {
+      if (bookmark.is_private === true || bookmark.is_private === 1) continue
+      pool.push(bookmark)
+    }
+  }
+
+  const hot = pool
+    .filter((bookmark) => (bookmark.click_count ?? 0) > 0)
+    .sort((a, b) => (
+      (b.click_count ?? 0) - (a.click_count ?? 0)
+      || a.sort - b.sort
+      || a.id - b.id
+    ))
+  if (hot.length >= n) return hot.slice(0, n)
+
+  const rest = pool
+    .filter((bookmark) => (bookmark.click_count ?? 0) <= 0)
+    .sort((a, b) => a.sort - b.sort || a.id - b.id)
+
+  return [...hot, ...rest].slice(0, n)
+}
+
+export function getCategoryTreeBookmarkCount(
+  category: CategoryNode<PublicCategory>,
+  categoryBookmarks: Map<number, PublicBookmark[]>,
+): number {
+  return (categoryBookmarks.get(category.id)?.length ?? 0)
+    + category.children.reduce(
+      (total, child) => total + (categoryBookmarks.get(child.id)?.length ?? 0),
+      0,
+    )
+}
+
+export function getHomeSections(
+  categories: CategoryNode<PublicCategory>[],
+  categoryBookmarks: Map<number, PublicBookmark[]>,
+): HomeSection[] {
+  return categories.map((category) => {
+    const children = (category.children ?? []).map((child) => ({
+      id: `category-${child.id}`,
+      categoryId: child.id,
+      title: child.title,
+      icon: child.icon,
+      icon_display: child.icon_display,
+      icon_revision: child.icon_revision,
+      icon_write_epoch: child.icon_write_epoch,
+      count: categoryBookmarks.get(child.id)?.length ?? 0,
+      children: [],
+    }))
+
+    return {
+      id: `category-${category.id}`,
+      categoryId: category.id,
+      title: category.title,
+      icon: category.icon,
+      icon_display: category.icon_display,
+      icon_revision: category.icon_revision,
+      icon_write_epoch: category.icon_write_epoch,
+      count: getCategoryTreeBookmarkCount(category, categoryBookmarks),
+      children,
+    }
+  })
+}
+
+export function resolveHomeActiveSectionId(sections: HomeSection[], activeId: string): string {
+  const ids = new Set(sections.flatMap((section) => [section.id, ...section.children.map((child) => child.id)]))
+  return ids.has(activeId) ? activeId : sections[0]?.id ?? ''
+}
+
+export function resolveHomeCategorySelection(
+  forest: CategoryNode<PublicCategory>[],
+  activeId: string | number | null | undefined,
+): HomeCategorySelection {
+  const normalizedId = String(activeId ?? '')
+
+  for (const root of forest) {
+    if (`category-${root.id}` === normalizedId || String(root.id) === normalizedId) {
+      return { root, child: null }
+    }
+
+    const child = root.children.find((candidate) => (
+      `category-${candidate.id}` === normalizedId || String(candidate.id) === normalizedId
+    ))
+    if (child) return { root, child }
+  }
+
+  return { root: forest[0] ?? null, child: null }
+}
+
+export function resolveHomeCategoryForRoot(
+  root: CategoryNode<PublicCategory>,
+  activeId: string | number | null | undefined,
+  categoryBookmarks?: ReadonlyMap<number, PublicBookmark[]>,
+): CategoryNode<PublicCategory> {
+  const normalizedId = String(activeId ?? '')
+
+  // 一级直属书签为空时，默认展示按 sort 排在最前的二级分类；
+  // category.children 已由 buildCategoryForest 按 sort、id 排好序。
+  const defaultCategory = categoryBookmarks
+    && (categoryBookmarks.get(root.id)?.length ?? 0) === 0
+    && root.children.length > 0
+    ? root.children[0]
+    : root
+
+  if (normalizedId === String(root.id) || normalizedId === `category-${root.id}`) return defaultCategory
+
+  return root.children.find((child) => (
+    normalizedId === String(child.id) || normalizedId === `category-${child.id}`
+  )) ?? defaultCategory
+}
+
+export function getHomeCategoryGroups(
+  forest: CategoryNode<PublicCategory>[],
+  selectedCategoryIds: ReadonlyMap<number, number>,
+  categoryBookmarks?: ReadonlyMap<number, PublicBookmark[]>,
+): HomeCategoryGroup[] {
+  return forest.map((root) => ({
+    root,
+    selected: resolveHomeCategoryForRoot(root, selectedCategoryIds.get(root.id), categoryBookmarks),
+  }))
+}
+
+export function resolveActiveHomeRootId(
+  sectionTops: Map<number, number>,
+  threshold: number,
+): number | null {
+  let passedRootId: number | null = null
+  let nearestRootId: number | null = null
+  let passedTop = Number.NEGATIVE_INFINITY
+  let nearestTop = Number.POSITIVE_INFINITY
+
+  for (const [rootId, top] of sectionTops) {
+    if (top <= threshold && top > passedTop) {
+      passedTop = top
+      passedRootId = rootId
+    }
+    if (top < nearestTop) {
+      nearestTop = top
+      nearestRootId = rootId
+    }
+  }
+
+  return passedRootId ?? nearestRootId
+}
+
+export function getVisibleCategoryForest(
+  forest: CategoryNode<PublicCategory>[],
+  visibleCategoryIds: Set<number> | null,
+): CategoryNode<PublicCategory>[] {
+  return visibleCategoryIds ? filterCategoryForest(forest, visibleCategoryIds) : forest
+}
+
+export type HomeScrollTargetInput = {
+  currentScroll: number
+  targetTop: number
+  windowHeight: number
+  documentHeight: number
+  desiredTopDistance?: number
+}
+
+export function getHomeScrollTarget({
+  currentScroll,
+  targetTop,
+  windowHeight,
+  documentHeight,
+  desiredTopDistance = 80,
+}: HomeScrollTargetInput): number {
+  const targetScroll = currentScroll + targetTop - desiredTopDistance
+  const maxScroll = documentHeight - windowHeight
+  return Math.max(0, Math.min(targetScroll, maxScroll))
+}
+
+export function createHomeDataMemo() {
+  let sortedCategoriesSource: PublicCategory[] | null = null
+  let sortedCategoriesMemo: PublicCategory[] = []
+  let categoryForestSource: PublicCategory[] | null = null
+  let categoryForestMemo: CategoryNode<PublicCategory>[] = []
+  let sortedBookmarksSource: PublicBookmark[] | null = null
+  let sortedBookmarksMemo: PublicBookmark[] = []
+  let categoryTitleSource: PublicCategory[] | null = null
+  let categoryTitleMemo = new Map<number, string>()
+  let searchIndexBookmarksSource: PublicBookmark[] | null = null
+  let searchIndexCategoriesSource: PublicCategory[] | null = null
+  let searchIndexMemo = new Map<number, string>()
+
+  return {
+    getSortedCategories(items: PublicCategory[]): PublicCategory[] {
+      if (items === sortedCategoriesSource) return sortedCategoriesMemo
+
+      sortedCategoriesSource = items
+      sortedCategoriesMemo = flattenCategoryForest(buildCategoryForest(normalizeCategories(items)))
+      return sortedCategoriesMemo
+    },
+
+    getCategoryForest(items: PublicCategory[]): CategoryNode<PublicCategory>[] {
+      if (items === categoryForestSource) return categoryForestMemo
+
+      categoryForestSource = items
+      categoryForestMemo = buildCategoryForest(normalizeCategories(items))
+      return categoryForestMemo
+    },
+
+    getSortedBookmarks(items: PublicBookmark[]): PublicBookmark[] {
+      if (items === sortedBookmarksSource) return sortedBookmarksMemo
+
+      sortedBookmarksSource = items
+      sortedBookmarksMemo = [...items].sort((a, b) => a.sort - b.sort)
+      return sortedBookmarksMemo
+    },
+
+    getCategoryTitleMap(items: PublicCategory[]): Map<number, string> {
+      if (items === categoryTitleSource) return categoryTitleMemo
+
+      categoryTitleSource = items
+      categoryTitleMemo = getCategoryPathMap(items)
+      return categoryTitleMemo
+    },
+
+    getSearchIndex(
+      items: PublicBookmark[],
+      categoryItems: PublicCategory[],
+      categoryTitles: Map<number, string>,
+    ): Map<number, string> {
+      if (items === searchIndexBookmarksSource && categoryItems === searchIndexCategoriesSource) {
+        return searchIndexMemo
+      }
+
+      searchIndexBookmarksSource = items
+      searchIndexCategoriesSource = categoryItems
+      searchIndexMemo = buildSearchIndex(items, categoryTitles)
+      return searchIndexMemo
+    },
+  }
+}

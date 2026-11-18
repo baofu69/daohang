@@ -1,0 +1,36 @@
+import type { Bookmark, PublicBookmark } from '../../shared/types'
+import type { BookmarkFormValue, CategoryFormValue } from './adminTypes'
+
+export function createCategoryDraft(parentId: string | number | null = null): Partial<CategoryFormValue> {
+  return {
+    parent_id: parentId,
+    title: '',
+    icon: '',
+  }
+}
+
+export function createBookmarkDraft(categoryId: string | number | undefined, initialUrl = ''): Partial<BookmarkFormValue> {
+  return {
+    category_id: categoryId,
+    title: '',
+    url: initialUrl,
+    icon: '',
+    icon_background_color: '',
+    description: '',
+    description_mode: 'inherit',
+    open_method: 'new_tab',
+  }
+}
+
+export function findBookmarkForEdit(
+  bookmarkId: string | number,
+  adminBookmarks: Bookmark[],
+  publicBookmarks: PublicBookmark[] = [],
+): Bookmark | PublicBookmark | null {
+  const id = Number(bookmarkId)
+  return (
+    adminBookmarks.find((bookmark) => bookmark.id === id) ??
+    publicBookmarks.find((bookmark) => bookmark.id === id) ??
+    null
+  )
+}

@@ -1,0 +1,146 @@
+# CF-Navs 快速开始指南
+
+这是一份简化的部署指南，适合快速上手。完整文档请查看 [DEPLOYMENT.md](DEPLOYMENT.md)。
+
+## 部署方式选择
+
+- **Wrangler CLI 部署**：适合本地可运行命令行的用户，完整控制 D1/KV 创建和部署，并通过 `/install` 完成 schema 与管理员初始化。
+- **Cloudflare 控制台在线部署**：适合先 Fork 项目，再通过 Cloudflare 关联 GitHub 自动构建部署的用户。
+- **GitHub Actions 部署（备选）**：当 Cloudflare Workers Builds 不可用时，可用仓库内置 workflow 在推送后自动部署；默认不启用，需要显式设置仓库变量和 Cloudflare API Token。
+
+## 方式一：Wrangler CLI 部署
+
+### 1. 克隆项目并安装依赖
+
+```bash
+git clone https://github.com/lbjxr/CF-Navs.git
+cd CF-Navs
+npm install
+```
+
+### 2. 创建 Cloudflare 资源
+
+```bash
+# 登录 Cloudflare
+npx wrangler login
+
+# 创建 D1 数据库
+npx wrangler d1 create cf-navs-db
+
+# 创建 KV 命名空间
+npx wrangler kv namespace create SESSION
+```
+
+### 3. 生成本地 Wrangler 配置
+
+不要把真实 Cloudflare 资源 ID 提交到公开的 `wrangler.toml`。运行下面命令生成 Git 忽略的 `wrangler.local.toml`：
+
+```bash
+npm run setup:wrangler
+```
+
+### 4. 首次部署
+
+```bash
+npm run deploy
+```
+
+- 首轮部署完成后再设置 Secret；Worker 尚未创建时，不能用 `wrangler secret put` 提前写入。
+
+### 5. 设置一次性安装令牌
+
+```bash
+npx wrangler secret put SETUP_TOKEN
+# 输入足够长的随机值，并安全保存到完成安装
+```
+
+### 6. Secret 生效后重新部署
+
+```bash
+npm run deploy
+```
+
+### 7. 完成安装
+
+访问返回的 Workers URL 并打开 `/install`，输入 `SETUP_TOKEN`，再创建管理员用户名和密码。安装器会初始化数据库 schema；确认登录成功后，建议删除或轮换 `SETUP_TOKEN`。
+
+`npm run db:init:remote` 仅作为安装器无法初始化 schema 时的恢复命令，不是全新 CLI 部署的正常步骤。
+
+部署新版后建议强制刷新一次页面，让新版 Service Worker 接管。首页应同时展示所有一级分类分组；每组默认显示直属书签，一级标题后用括号显示总站点数，二级分类横向标签继续紧随其后，点击后只替换当前分组内容。管理员的新增书签和排序操作与标题保持同一行。输入搜索关键词后应切换到全站一级分类分组结果，清除关键词后恢复各分组此前选择的分类。
+
+在“站点设置”中修改配置时，右侧首页预览会使用未保存的表单值实时展示浅色/深色主题、首页标题、经常访问区域、卡片和布局效果；预览中的自定义 CSS 与页脚 HTML 只在隔离环境中检查，不会执行脚本或保存数据。首页打开书签后会累计点击次数，进入后台“访问分析”会刷新数据并显示总点击、已访问/零访问书签、Top 20 排行和零访问书签分页。
+
+一级标题、二级标签、搜索分组和折叠导航应显示已保存的分类图片、data URI、文字或表情图标。打开浏览器 Network 面板时，普通对象图标 `/api/icon/*` 与 `/api/category-icon/*` 的客户端响应应为 `no-store`，不应从浏览器磁盘缓存直接返回；Worker edge 负责公开正文复用，因此重新打开浏览器可能再次出现网络请求。新增/编辑弹窗、后台预览和首页已保存的 Iconify 图标都应请求同源 `/api/iconify/*`，公开正文可由 Worker edge cache 复用。
+
+编辑书签时弹窗应立即显示，随后可在后台调用 `/api/bookmarks/:id/icon-cache/refresh` 刷新普通书签图标缓存；保存书签后也会显式刷新。该请求遇到慢速外站图标时不应长时间卡住保存流程；如果缓存失败但保存的是 `https://favicon.im/...`、Google favicon 或自定义 HTTP(S) 图标，首页仍应使用已保存 URL 显示图标，而不是退成标题首字。
+
+## 方式二：Cloudflare 控制台在线部署
+
+1. 在 GitHub 上 Fork 本仓库。
+2. 进入 Cloudflare 控制台的 **Workers & Pages → Create application → Import a repository**，关联 GitHub 并选择你的 fork。已有 Fork 不能使用通用 Deploy Button：该按钮会创建新 GitHub 仓库，不能指定现有 Fork。
+3. 生产分支选择 `main`，根目录填写 `/`，Build command 填写 `npm run build`，Deploy command 填写：
+
+```bash
+npx wrangler deploy
+```
+
+4. 保存并完成首轮生产部署。Cloudflare 的 Git 引导流程会根据 `wrangler.toml` 中不带 ID 的声明创建并绑定 `DB` D1 数据库与 `SESSION` KV 命名空间。
+
+
+5. 首轮部署完成后，在该 Worker 的 **设置 → 变量和密钥** 中选择**生产环境**，添加一个类型为**密钥**的变量，变量名填写 `SETUP_TOKEN`，值填写一段足够长且随机的字符串。
+6. 保存 Secret 后重新触发生产分支部署。打开部署后的 Workers URL，并访问 `/install`。输入 `SETUP_TOKEN`，再设置管理员用户名和密码；安装器会初始化数据库 schema 和管理员账号。
+7. 进入该 Worker 的 **域和路由** 页面，关闭两个 Workers URL，然后添加并启用你的自定义域名。
+
+`package.json` 的 Cloudflare Git 元数据只声明 D1/KV 资源，不声明 `SETUP_TOKEN` 或旧版恢复 Secret，因此 GitHub 导入不会自动生成或填充 Secret 参数。默认路径无需 Cloudflare API Token、GitHub Actions 或手动 SQL；只有选用方式三时才需要前两者。只有安装器报 schema 初始化错误时，才在 D1 SQL Console 执行 [schema.sql](../../schema.sql) 进行恢复。首次部署请从生产分支 `main` 触发，资源创建完成前不要使用预览分支自动部署。
+
+## 方式三：GitHub Actions（备选）
+
+仅当 Cloudflare Workers Builds / Git 导入不可用时使用；默认部署仍是 Cloudflare 账号关联的 Git 构建。启用后，推送到部署分支会自动执行构建和 `wrangler deploy`。
+
+1. Fork 后创建或复用 `cf-navs-db` D1 与 `SESSION` KV 命名空间。
+2. 创建具备 Workers Scripts、D1、KV 编辑权限的 Cloudflare API Token。
+3. 在 fork 的 **Settings → Secrets and variables → Actions** 添加 Secrets `CLOUDFLARE_API_TOKEN`、`CLOUDFLARE_ACCOUNT_ID`，并添加 Variable `CF_NAVS_DEPLOY_PROVIDER=github-actions`；默认部署分支是 `develop`，以 `main` 为生产分支时再加 `CF_NAVS_DEPLOY_BRANCH=main`。
+4. 断开该 Worker 的 Workers Builds / Git 集成，避免重复部署。
+5. 推送到部署分支后，按下方首次登录步骤设置 `SETUP_TOKEN` 并访问 `/install`。
+
+完整权限、资源命名和排障要求见 [DEPLOYMENT.md](DEPLOYMENT.md) 的「方式三」。
+
+## 🔑 首次登录
+
+### Cloudflare Git 或 Wrangler CLI 新安装
+
+1. 访问 `https://你的站点/install`
+2. 输入部署时保存的 `SETUP_TOKEN`
+3. 设置管理员用户名和密码
+4. 安装完成后按页面提示登录
+5. 确认登录成功后，建议进入该 Worker 的 **设置 → 变量和密钥** 删除或轮换 `SETUP_TOKEN`
+
+### 旧数据库升级 / 凭据恢复
+
+`INIT_ADMIN_USER`、`INIT_ADMIN_PASSWORD` 和 `RESET_ADMIN_CREDENTIALS` 仅用于已有旧数据库的升级或凭据恢复，不是全新 Wrangler CLI 安装入口。旧数据库首次升级时，可设置一个新的 `RESET_ADMIN_CREDENTIALS` 标记后重新部署一次。
+
+登录成功后会回到前台首页，需要进入后台时再次点击右上角管理入口。
+
+## 📝 下一步
+
+- 在“站点信息”中修改标题、标题颜色和字号
+- 如需外部上传入口，在“站点信息 → 外部资源”配置图床服务地址
+- 添加书签和分类
+- 新增书签时选择文字图标配色方案
+- 登录后在首页右键书签进行快捷编辑
+- 在“外观与卡片”中选择配色和卡片展示方式；在“高级与视觉”中配置背景、尺寸、卡片表面和分类标题视觉
+- 配置搜索引擎
+- 在“站点信息”中配置首页标题显示、搜索框、搜索引擎选择器和“经常访问”展示数量
+- 在“访问分析”中查看书签点击排行与零访问书签
+
+完整功能说明请查看 [README.md](../../README.md)。
+
+## ❓ 遇到问题？
+
+1. 检查 [DEPLOYMENT.md](DEPLOYMENT.md) 中的故障排查部分
+2. 查看 Worker 日志：`npx wrangler tail`
+3. 提交 Issue 到 GitHub
+
+---
+
+祝你使用愉快！🎉
